@@ -1,0 +1,8 @@
+numpy
+Pillow
+pytest
+tensorflow; sys_platform == "win32"
+tflite-runtime; sys_platform == "linux"
+opencv-python-headless
+PySide6
+reportlab
