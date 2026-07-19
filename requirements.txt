@@ -6,3 +6,5 @@ tflite-runtime; sys_platform == "linux"
 opencv-python-headless
 PySide6
 reportlab
+pandas
+scikit-learn

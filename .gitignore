@@ -6,3 +6,8 @@ data/captures/
 data/uploads/
 *.pdf
 .pytest_cache/
+dataset_prep/filtered/
+dataset_prep/cdr/_check_output/
+dataset_prep/cdr/raw/
+dataset_prep/cdr/cup_dataset/
+dataset_prep/split/

@@ -414,7 +414,8 @@ class ResultsScreen(QWidget):
             detail = "No signs of retinal disease detected. Routine check-up in 12 months."
         elif diagnosis == "Glaucoma" or cdr >= 0.65:
             title = "Refer to ophthalmologist"
-            detail = f"CDR of {cdr:.2f} exceeds safe threshold. Glaucoma screening recommended."
+            cdr_status = "elevated" if cdr >= 0.65 else "within normal range"
+            detail = f"CDR: {cdr:.2f} ({cdr_status}). Glaucoma screening recommended."
         elif diagnosis == "Diabetic Retinopathy" or haemorrhage_count > 2:
             title = "Urgent referral recommended"
             detail = f"{haemorrhage_count} haemorrhages detected. Immediate ophthalmology review needed."

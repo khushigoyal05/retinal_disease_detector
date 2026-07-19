@@ -263,11 +263,12 @@ def _get_recommendation(diagnosis: str, cdr: float,
                       "Routine check-up in 12 months recommended."
         }
     elif diagnosis == "Glaucoma" or cdr >= 0.65:
+        cdr_status = "elevated" if cdr >= 0.65 else "within normal range"
         return {
             "title": "Refer to ophthalmologist",
-            "detail": f"CDR of {cdr:.2f} exceeds safe threshold of 0.65. "
-                      "Glaucoma screening strongly recommended."
+            "detail": f"CDR: {cdr:.2f} ({cdr_status}). Glaucoma screening strongly recommended."
         }
+    
     elif diagnosis == "Diabetic Retinopathy" or haemorrhage_count > 2:
         return {
             "title": "Urgent referral recommended",
