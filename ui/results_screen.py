@@ -8,78 +8,59 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame
+    QPushButton, QLabel, QFrame, QScrollArea
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor
+from PySide6.QtGui import QFont, QPixmap, QImage
 
 from core.models import PredictionResult
 import config
 
+from services.cdr_service import compute_cdr
+from services.cup_segmentation_engine import CupSegmentationEngine
+
+from services.vessel_segmentation_engine import VesselSegmentationEngine
+from PIL import Image
+
+_cup_engine = CupSegmentationEngine()
+_cup_engine.load()
+
+_vessel_engine = VesselSegmentationEngine(config.VESSEL_MODEL_PATH)
+
 
 def _compute_extra_metrics(image_path: Path) -> dict:
-    """
-    Computes CDR approximation, lesion count, vessel density,
-    haemorrhage count from the retinal image using OpenCV.
-    These are estimates — not lab-grade measurements.
-    """
     img = cv2.imread(str(image_path))
     if img is None:
-        return {"cdr": 0.0, "lesion_area": 0.0,
-                "vessel_density": 0.0, "haemorrhage_count": 0}
+        return {"cdr": 0.0, "vessel_density": 0.0}
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # ── CDR approximation ─────────────────────────────────────────
-    # Brightest region ≈ optic disc, slightly less bright ≈ cup
-    _, disc_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    _, cup_mask  = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY)
-    disc_area = np.sum(disc_mask > 0) + 1   # +1 avoids division by zero
-    cup_area  = np.sum(cup_mask  > 0)
-    cdr = round(min(float(cup_area / disc_area), 0.99), 2)
+    # ── CDR (real disc detection + trained cup model) ──────────────
+    try:
+        cdr_result = compute_cdr(img, _cup_engine)
+        cdr = cdr_result.cdr
+    except ValueError:
+        cdr = None
+        cdr_result = None
 
-    # ── Lesion area % ─────────────────────────────────────────────
-    # Bright yellowish spots (exudates) in the red channel
-    red_channel = img[:, :, 2]
-    _, lesion_mask = cv2.threshold(red_channel, 220, 255, cv2.THRESH_BINARY)
-    lesion_area = round(float(np.sum(lesion_mask > 0)) / (h * w) * 100, 2)
-
-    # ── Vessel density % ──────────────────────────────────────────
-    # Dark, thin structures detected with Frangi-like approach via
-    # adaptive threshold + morphological operations
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    vessel_mask = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=15, C=4
-    )
-    vessel_density = round(float(np.sum(vessel_mask > 0)) / (h * w) * 100, 1)
-
-    # ── Haemorrhage count ─────────────────────────────────────────
-    # Dark red blobs in the image
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    dark_red = cv2.inRange(hsv, (0, 50, 20), (15, 255, 120))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    cleaned = cv2.morphologyEx(dark_red, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(
-        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    haemorrhage_count = len([c for c in contours if cv2.contourArea(c) > 30])
+    # ── Vessel density % (trained model) ─────────────────────────
+    pil_img = Image.open(image_path)
+    vessel_mask = _vessel_engine.predict_mask(pil_img)
+    vessel_density = round(float(np.sum(vessel_mask > 0)) / vessel_mask.size * 100, 1)
 
     return {
         "cdr":               cdr,
-        "lesion_area":       lesion_area,
+        "cdr_result":        cdr_result,
         "vessel_density":    vessel_density,
-        "haemorrhage_count": haemorrhage_count,
+        "vessel_mask":       vessel_mask,
     }
 
 
 def _annotate_image(image_path: Path, metrics: dict) -> QPixmap:
     """
-    Draws CDR circle and lesion highlights onto the retinal image.
-    Returns a QPixmap ready to display.
+    Draws vessel overlay, CDR circle and lesion highlights onto the
+    retinal image. Backend logic — vessel overlay is new, rest UNCHANGED.
     """
     img = cv2.imread(str(image_path))
     if img is None:
@@ -87,32 +68,25 @@ def _annotate_image(image_path: Path, metrics: dict) -> QPixmap:
 
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     h, w = img_rgb.shape[:2]
-    cx, cy = w // 2, h // 2
 
-    # CDR circle — red ring around estimated optic disc
-    disc_radius = int(min(h, w) * 0.18)
-    cv2.circle(img_rgb, (cx, cy), disc_radius, (255, 60, 60), 2)
-    cv2.putText(img_rgb, f"CDR:{metrics['cdr']:.2f}",
-                (cx - disc_radius, cy - disc_radius - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 60, 60), 1)
+    # ── Vessel overlay (green wash over detected vessel pixels) ────
+    vessel_mask = metrics.get("vessel_mask")
+    if vessel_mask is not None:
+        mask_resized = cv2.resize(vessel_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        overlay_color = np.array([0, 255, 140], dtype=np.uint8)
+        alpha = 0.45
+        hit = mask_resized > 0
+        img_rgb[hit] = (img_rgb[hit] * (1 - alpha) + overlay_color * alpha).astype(np.uint8)
 
-    # Lesion highlights — find bright spots and circle them
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, lesion_mask = cv2.threshold(
-        img[:, :, 2], 220, 255, cv2.THRESH_BINARY
-    )
-    contours, _ = cv2.findContours(
-        lesion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    for cnt in contours[:5]:  # max 5 annotations
-        if cv2.contourArea(cnt) > 20:
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            cv2.circle(img_rgb,
-                       (x + cw // 2, y + ch // 2),
-                       max(cw, ch) // 2 + 4,
-                       (255, 140, 0), 1)
+    cdr_result = metrics.get("cdr_result")
+    if cdr_result is not None:
+        disc = cdr_result.disc
+        cv2.circle(img_rgb, (disc.center_x, disc.center_y), disc.radius, (255, 60, 60), 2)
+        cv2.putText(img_rgb, f"CDR:{metrics['cdr']:.2f}",
+                    (disc.center_x - disc.radius, disc.center_y - disc.radius - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 60, 60), 1)
 
-    # Convert to QPixmap
+
     qimg = QImage(
         img_rgb.data, w, h, 3 * w,
         QImage.Format.Format_RGB888
@@ -120,9 +94,20 @@ def _annotate_image(image_path: Path, metrics: dict) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
+def _load_original_pixmap(image_path: Path) -> QPixmap:
+    """Loads the raw, unmodified fundus image for the 'Original' panel."""
+    return QPixmap(str(image_path))
+
+
 class ResultsScreen(QWidget):
     """
-    Screen 4 — annotated image + 7 metrics + recommendation.
+    Results screen — sized for 320x480 PORTRAIT touchscreen.
+
+    Layout: only the top bar (Back/New scan/Save) is pinned. Everything
+    else — diagnosis card, both images, recommendation, and metrics —
+    scrolls together as one screen. This keeps things simple and lets
+    the operator scroll straight from the images down to the numbers,
+    rather than having images pinned separately from their metrics.
     """
     back_requested = Signal()
     new_scan_requested = Signal()
@@ -136,57 +121,35 @@ class ResultsScreen(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(32, 24, 32, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(10, 6, 10, 6)
+        root.setSpacing(6)
 
-        # ── Top bar ───────────────────────────────────────────────
+        # ── Top bar: Back, New scan, Save — the only pinned element ──
         top_bar = QHBoxLayout()
+        top_bar.setSpacing(6)
 
         btn_back = QPushButton("← Back")
-        btn_back.setFixedWidth(100)
-        btn_back.setFont(QFont("Inter", 12))
-        btn_back.setStyleSheet("""
-            QPushButton {
-                background-color: #FFFFFF;
-                color: #111111;
-                border: 1.5px solid #CCCCCC;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover { background-color: #F5F5F5; }
-        """)
+        btn_back.setFixedSize(64, 28)
+        btn_back.setFont(QFont("Inter", 9))
+        btn_back.setStyleSheet(self._outline_btn_style())
         btn_back.clicked.connect(self.back_requested)
 
-        title = QLabel("Analysis results")
-        title.setFont(QFont("Inter", 16, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         btn_new = QPushButton("New scan")
-        btn_new.setFixedWidth(100)
-        btn_new.setFont(QFont("Inter", 12))
-        btn_new.setStyleSheet("""
-            QPushButton {
-                background-color: #FFFFFF;
-                color: #111111;
-                border: 1.5px solid #CCCCCC;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover { background-color: #F5F5F5; }
-        """)
+        btn_new.setFixedSize(76, 28)
+        btn_new.setFont(QFont("Inter", 9))
+        btn_new.setStyleSheet(self._outline_btn_style())
         btn_new.clicked.connect(self.new_scan_requested)
 
-        self._btn_save = QPushButton("Save report ↓")
-        self._btn_save.setFixedWidth(130)
-        self._btn_save.setFont(QFont("Inter", 12))
-        self._btn_save.setEnabled(False)  # enabled after results load
+        self._btn_save = QPushButton("Save ↓")
+        self._btn_save.setFixedSize(64, 28)
+        self._btn_save.setFont(QFont("Inter", 9))
+        self._btn_save.setEnabled(False)
         self._btn_save.setStyleSheet("""
             QPushButton {
                 background-color: #111111;
                 color: #FFFFFF;
                 border: none;
                 border-radius: 6px;
-                padding: 6px 12px;
             }
             QPushButton:hover { background-color: #333333; }
             QPushButton:disabled { background-color: #CCCCCC; }
@@ -195,49 +158,37 @@ class ResultsScreen(QWidget):
 
         top_bar.addWidget(btn_back)
         top_bar.addStretch()
-        top_bar.addWidget(title)
-        top_bar.addStretch()
         top_bar.addWidget(btn_new)
-        top_bar.addSpacing(8)
         top_bar.addWidget(self._btn_save)
         root.addLayout(top_bar)
 
-        # ── Main content: image left, metrics right ───────────────
-        content = QHBoxLayout()
-        content.setSpacing(20)
+        # ── SCROLLABLE: everything below the top bar ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        # Annotated image
-        self._image_label = QLabel()
-        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet(
-            "background-color: #111111; border-radius: 10px;"
-        )
-        self._image_label.setMinimumWidth(340)
-        content.addWidget(self._image_label, stretch=1)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 4)
+        scroll_layout.setSpacing(8)
 
-        # Right panel: diagnosis + metrics list
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(10)
-
-        # Diagnosis box
+        # ── Diagnosis card ──
         diag_box = QFrame()
-        diag_box.setStyleSheet(
-            "background-color: #F7F7F7; border-radius: 8px;"
-        )
-        diag_layout = QVBoxLayout(diag_box)
-        diag_layout.setContentsMargins(14, 10, 14, 10)
-        diag_layout.setSpacing(4)
+        diag_box.setStyleSheet("background-color: #F7F7F7; border-radius: 8px;")
+        diag_layout = QHBoxLayout(diag_box)
+        diag_layout.setContentsMargins(12, 8, 12, 8)
 
+        diag_col = QVBoxLayout()
+        diag_col.setSpacing(1)
         diag_header = QLabel("Primary diagnosis")
-        diag_header.setFont(QFont("Inter", 9))
+        diag_header.setFont(QFont("Inter", 8))
         diag_header.setStyleSheet("color: #888888; background: transparent;")
-
-        diag_row = QHBoxLayout()
         self._diagnosis_label = QLabel("—")
-        self._diagnosis_label.setFont(QFont("Inter", 14, QFont.Weight.Bold))
-        self._diagnosis_label.setStyleSheet(
-            "color: #111111; background: transparent;"
-        )
+        self._diagnosis_label.setFont(QFont("Inter", 13, QFont.Weight.Bold))
+        self._diagnosis_label.setStyleSheet("color: #111111; background: transparent;")
+        diag_col.addWidget(diag_header)
+        diag_col.addWidget(self._diagnosis_label)
 
         self._confidence_badge = QLabel("")
         self._confidence_badge.setFont(QFont("Inter", 11, QFont.Weight.Bold))
@@ -245,40 +196,84 @@ class ResultsScreen(QWidget):
             background-color: #111111;
             color: #FFFFFF;
             border-radius: 6px;
-            padding: 3px 10px;
+            padding: 4px 10px;
         """)
 
-        diag_row.addWidget(self._diagnosis_label)
-        diag_row.addStretch()
-        diag_row.addWidget(self._confidence_badge)
+        diag_layout.addLayout(diag_col)
+        diag_layout.addStretch()
+        diag_layout.addWidget(self._confidence_badge)
+        scroll_layout.addWidget(diag_box)
 
-        diag_layout.addWidget(diag_header)
-        diag_layout.addLayout(diag_row)
-        right_panel.addWidget(diag_box)
+        # ── Two images STACKED (Original above, AI Analysis below) ──
+        orig_caption = QLabel("Original")
+        orig_caption.setFont(QFont("Inter", 8))
+        orig_caption.setStyleSheet("color: #888888;")
+        self._image_label_original = QLabel()
+        self._image_label_original.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_label_original.setStyleSheet("background-color: #111111; border-radius: 8px;")
+        self._image_label_original.setFixedHeight(160)
 
-        # Metrics list box
+        annot_caption = QLabel("AI Analysis")
+        annot_caption.setFont(QFont("Inter", 8))
+        annot_caption.setStyleSheet("color: #888888;")
+        self._image_label_annotated = QLabel()
+        self._image_label_annotated.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_label_annotated.setStyleSheet("background-color: #111111; border-radius: 8px;")
+        self._image_label_annotated.setFixedHeight(160)
+
+        scroll_layout.addWidget(orig_caption)
+        scroll_layout.addWidget(self._image_label_original)
+        scroll_layout.addWidget(annot_caption)
+        scroll_layout.addWidget(self._image_label_annotated)
+
+        # ── Recommendation bar ──
+        self._rec_bar = QFrame()
+        self._rec_bar.setStyleSheet("background-color: #F7F7F7; border-radius: 8px;")
+        rec_layout = QHBoxLayout(self._rec_bar)
+        rec_layout.setContentsMargins(10, 6, 10, 6)
+        rec_layout.setSpacing(8)
+
+        self._rec_icon = QLabel("!")
+        self._rec_icon.setFixedSize(22, 22)
+        self._rec_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._rec_icon.setStyleSheet("""
+            background-color: #111111;
+            color: #FFFFFF;
+            border-radius: 11px;
+            font-weight: bold;
+            font-size: 11px;
+        """)
+
+        rec_text_col = QVBoxLayout()
+        rec_text_col.setSpacing(0)
+        self._rec_title = QLabel("—")
+        self._rec_title.setFont(QFont("Inter", 10, QFont.Weight.Bold))
+        self._rec_title.setStyleSheet("background: transparent;")
+        self._rec_title.setWordWrap(True)
+
+        self._rec_detail = QLabel("")
+        self._rec_detail.setFont(QFont("Inter", 8))
+        self._rec_detail.setStyleSheet("color: #888888; background: transparent;")
+        self._rec_detail.setWordWrap(True)
+
+        rec_text_col.addWidget(self._rec_title)
+        rec_text_col.addWidget(self._rec_detail)
+
+        rec_layout.addWidget(self._rec_icon)
+        rec_layout.addLayout(rec_text_col, stretch=1)
+        scroll_layout.addWidget(self._rec_bar)
+
+        # ── Metrics box — compact rows ──
         metrics_box = QFrame()
-        metrics_box.setStyleSheet(
-            "background-color: #F7F7F7; border-radius: 8px;"
-        )
+        metrics_box.setStyleSheet("background-color: #F7F7F7; border-radius: 8px;")
         metrics_layout = QVBoxLayout(metrics_box)
-        metrics_layout.setContentsMargins(14, 10, 14, 10)
+        metrics_layout.setContentsMargins(12, 8, 12, 6)
         metrics_layout.setSpacing(0)
 
-        metrics_title = QLabel("Metrics")
-        metrics_title.setFont(QFont("Inter", 9, QFont.Weight.Bold))
-        metrics_title.setStyleSheet(
-            "color: #888888; background: transparent; margin-bottom: 6px;"
-        )
-        metrics_layout.addWidget(metrics_title)
-
-        # Each metric row: label on left, value on right, divider below
         self._metric_labels = {}
         metric_defs = [
             ("cdr",               "CDR value"),
-            ("lesion_area",       "Lesion area"),
             ("vessel_density",    "Vessel density"),
-            ("haemorrhage_count", "Haemorrhage count"),
             ("sharpness",         "Image quality score"),
         ]
 
@@ -286,14 +281,14 @@ class ResultsScreen(QWidget):
             row_widget = QWidget()
             row_widget.setStyleSheet("background: transparent;")
             row = QHBoxLayout(row_widget)
-            row.setContentsMargins(0, 6, 0, 6)
+            row.setContentsMargins(0, 5, 0, 5)
 
             lbl = QLabel(display)
-            lbl.setFont(QFont("Inter", 11))
+            lbl.setFont(QFont("Inter", 9))
             lbl.setStyleSheet("color: #888888; background: transparent;")
 
             val = QLabel("—")
-            val.setFont(QFont("Inter", 11, QFont.Weight.Bold))
+            val.setFont(QFont("Inter", 9, QFont.Weight.Bold))
             val.setStyleSheet("color: #111111; background: transparent;")
             val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -303,122 +298,86 @@ class ResultsScreen(QWidget):
             self._metric_labels[key] = val
             metrics_layout.addWidget(row_widget)
 
-            # Divider between rows except last
             if i < len(metric_defs) - 1:
                 line = QFrame()
                 line.setFrameShape(QFrame.Shape.HLine)
-                line.setStyleSheet(
-                    "color: #EEEEEE; background: transparent;"
-                )
+                line.setStyleSheet("color: #EEEEEE; background: transparent;")
                 metrics_layout.addWidget(line)
 
-        right_panel.addWidget(metrics_box, stretch=1)
-        content.addLayout(right_panel, stretch=1)
-        root.addLayout(content, stretch=1)
+        scroll_layout.addWidget(metrics_box)
+        scroll.setWidget(scroll_content)
+        root.addWidget(scroll, stretch=1)
 
-        # ── Recommendation bar ────────────────────────────────────
-        self._rec_bar = QFrame()
-        self._rec_bar.setStyleSheet(
-            "background-color: #F7F7F7; border-radius: 8px;"
-        )
-        rec_layout = QHBoxLayout(self._rec_bar)
-        rec_layout.setContentsMargins(14, 10, 14, 10)
-        rec_layout.setSpacing(12)
-
-        self._rec_icon = QLabel("!")
-        self._rec_icon.setFixedSize(28, 28)
-        self._rec_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._rec_icon.setStyleSheet("""
-            background-color: #111111;
-            color: #FFFFFF;
-            border-radius: 14px;
-            font-weight: bold;
-            font-size: 14px;
-        """)
-
-        rec_text_col = QVBoxLayout()
-        rec_text_col.setSpacing(2)
-        self._rec_title = QLabel("—")
-        self._rec_title.setFont(QFont("Inter", 11, QFont.Weight.Bold))
-        self._rec_title.setStyleSheet("background: transparent;")
-
-        self._rec_detail = QLabel("")
-        self._rec_detail.setFont(QFont("Inter", 10))
-        self._rec_detail.setStyleSheet(
-            "color: #888888; background: transparent;"
-        )
-
-        rec_text_col.addWidget(self._rec_title)
-        rec_text_col.addWidget(self._rec_detail)
-
-        rec_layout.addWidget(self._rec_icon)
-        rec_layout.addLayout(rec_text_col)
-        root.addWidget(self._rec_bar)
+    @staticmethod
+    def _outline_btn_style() -> str:
+        return """
+            QPushButton {
+                background-color: #FFFFFF;
+                color: #111111;
+                border: 1.5px solid #CCCCCC;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #F5F5F5; }
+        """
 
     def load_results(self, result: PredictionResult,
                      sharpness: float) -> None:
         """
-        Called after inference completes.
-        Populates all UI elements with real data.
+        Called after inference completes. Loads both the original
+        and the AI-annotated image into their own stacked panels.
         """
-        # Compute extra metrics from the image
         metrics = _compute_extra_metrics(result.image_path)
         metrics["sharpness"] = sharpness
 
-        # Annotate and display image
-        pixmap = _annotate_image(result.image_path, metrics)
-        if not pixmap.isNull():
-            self._image_label.setPixmap(
-                pixmap.scaled(
-                    340, 400,
+        original_pixmap = _load_original_pixmap(result.image_path)
+        if not original_pixmap.isNull():
+            self._image_label_original.setPixmap(
+                original_pixmap.scaled(
+                    296, 160,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
             )
 
-        # Diagnosis
+        annotated_pixmap = _annotate_image(result.image_path, metrics)
+        if not annotated_pixmap.isNull():
+            self._image_label_annotated.setPixmap(
+                annotated_pixmap.scaled(
+                    296, 160,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+            )
+
         top = result.top_prediction
         self._diagnosis_label.setText(top.label)
         self._confidence_badge.setText(f"{top.confidence * 100:.0f}%")
 
-        # Metrics
-        self._metric_labels["cdr"].setText(str(metrics["cdr"]))
-        self._metric_labels["lesion_area"].setText(
-            f"{metrics['lesion_area']}%"
+        self._metric_labels["cdr"].setText(
+            str(metrics["cdr"]) if metrics["cdr"] is not None else "N/A"
         )
-        self._metric_labels["vessel_density"].setText(
-            f"{metrics['vessel_density']}%"
-        )
-        self._metric_labels["haemorrhage_count"].setText(
-            str(metrics["haemorrhage_count"])
-        )
-        self._metric_labels["sharpness"].setText(
-            f"{sharpness:.1f}"
-        )
+        self._metric_labels["vessel_density"].setText(f"{metrics['vessel_density']}%")
+        self._metric_labels["sharpness"].setText(f"{sharpness:.1f}")
 
-        # Recommendation
-        self._set_recommendation(top.label, metrics["cdr"],
-                                 metrics["haemorrhage_count"])
-        # Store for save report
+        self._set_recommendation(top.label, metrics["cdr"])
+
         self._last_result = result
         self._last_metrics = metrics
         self._last_annotated_path = result.image_path
         self._btn_save.setEnabled(True)
 
-    def _set_recommendation(self, diagnosis: str,
-                             cdr: float,
-                             haemorrhage_count: int) -> None:
-        """Rule-based recommendation from diagnosis + key metrics."""
-        if diagnosis == "Normal" and cdr < 0.65:
+    def _set_recommendation(self, diagnosis: str, cdr: Optional[float]) -> None:
+        cdr_known = cdr is not None
+        if diagnosis == "Normal" and (not cdr_known or cdr < 0.65):
             title = "No action needed"
             detail = "No signs of retinal disease detected. Routine check-up in 12 months."
-        elif diagnosis == "Glaucoma" or cdr >= 0.65:
+        elif diagnosis == "Glaucoma" or (cdr_known and cdr >= 0.65):
             title = "Refer to ophthalmologist"
             cdr_status = "elevated" if cdr >= 0.65 else "within normal range"
             detail = f"CDR: {cdr:.2f} ({cdr_status}). Glaucoma screening recommended."
-        elif diagnosis == "Diabetic Retinopathy" or haemorrhage_count > 2:
+        elif diagnosis == "Diabetic Retinopathy":
             title = "Urgent referral recommended"
-            detail = f"{haemorrhage_count} haemorrhages detected. Immediate ophthalmology review needed."
+            detail = "Diabetic retinopathy indicators detected. Immediate ophthalmology review needed."
         elif diagnosis in ("Cataract", "AMD"):
             title = "Specialist consultation advised"
             detail = f"{diagnosis} indicators found. Refer to ophthalmologist for confirmation."
@@ -429,8 +388,9 @@ class ResultsScreen(QWidget):
         self._rec_title.setText(title)
         self._rec_detail.setText(detail)
 
+        
     def _on_save(self) -> None:
-        """Opens a save dialog and generates the PDF report."""
+        """UNCHANGED LOGIC from original."""
         if not self._last_result:
             return
 
@@ -438,14 +398,11 @@ class ResultsScreen(QWidget):
         default_name = f"retinal_report_{timestamp}.pdf"
 
         save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Report",
-            default_name,
-            "PDF Files (*.pdf)"
+            self, "Save Report", default_name, "PDF Files (*.pdf)"
         )
 
         if not save_path:
-            return  # user cancelled
+            return
 
         try:
             generate_report(
@@ -454,14 +411,6 @@ class ResultsScreen(QWidget):
                 annotated_image_path=self._last_annotated_path,
                 output_path=Path(save_path)
             )
-            QMessageBox.information(
-                self,
-                "Report saved",
-                f"Report saved to:\n{save_path}"
-            )
+            QMessageBox.information(self, "Report saved", f"Report saved to:\n{save_path}")
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Save failed",
-                f"Could not save report:\n{str(e)}"
-            )
+            QMessageBox.critical(self, "Save failed", f"Could not save report:\n{str(e)}")

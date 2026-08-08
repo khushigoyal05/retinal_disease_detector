@@ -147,17 +147,11 @@ def generate_report(
     metric_rows = [
         ["Metric", "Value", "Notes"],
         ["CDR value",
-         str(metrics.get("cdr", "—")),
+         f"{metrics['cdr']:.2f}" if metrics.get("cdr") is not None else "N/A",
          "Normal < 0.65"],
-        ["Lesion area",
-         f"{metrics.get('lesion_area', 0):.1f}%",
-         "Exudate coverage"],
         ["Vessel density",
          f"{metrics.get('vessel_density', 0):.1f}%",
          "Blood vessel coverage"],
-        ["Haemorrhage count",
-         str(metrics.get("haemorrhage_count", 0)),
-         "Dark blob detection"],
         ["Image quality score",
          f"{metrics.get('sharpness', 0):.1f}",
          "Variance of Laplacian"],
@@ -231,8 +225,7 @@ def generate_report(
 
     rec = _get_recommendation(
         top.label,
-        metrics.get("cdr", 0.0),
-        metrics.get("haemorrhage_count", 0)
+        metrics.get("cdr")
     )
     story.append(Paragraph(rec["title"], body_style))
     story.append(Paragraph(rec["detail"], muted_style))
@@ -254,26 +247,25 @@ def generate_report(
     return output_path
 
 
-def _get_recommendation(diagnosis: str, cdr: float,
-                         haemorrhage_count: int) -> dict:
-    if diagnosis == "Normal" and cdr < 0.65:
+def _get_recommendation(diagnosis: str, cdr: Optional[float]) -> dict:
+    cdr_known = cdr is not None
+    if diagnosis == "Normal" and (not cdr_known or cdr < 0.65):
         return {
             "title": "No action needed",
             "detail": "No signs of retinal disease detected. "
                       "Routine check-up in 12 months recommended."
         }
-    elif diagnosis == "Glaucoma" or cdr >= 0.65:
+    elif diagnosis == "Glaucoma" or (cdr_known and cdr >= 0.65):
         cdr_status = "elevated" if cdr >= 0.65 else "within normal range"
+        cdr_text = f"{cdr:.2f}" if cdr_known else "unavailable"
         return {
             "title": "Refer to ophthalmologist",
-            "detail": f"CDR: {cdr:.2f} ({cdr_status}). Glaucoma screening strongly recommended."
+            "detail": f"CDR: {cdr_text} ({cdr_status if cdr_known else 'not measured'}). Glaucoma screening strongly recommended."
         }
-    
-    elif diagnosis == "Diabetic Retinopathy" or haemorrhage_count > 2:
+    elif diagnosis == "Diabetic Retinopathy":
         return {
             "title": "Urgent referral recommended",
-            "detail": f"{haemorrhage_count} haemorrhages detected. "
-                      "Immediate ophthalmology review needed."
+            "detail": "Diabetic retinopathy indicators detected. Immediate ophthalmology review needed."
         }
     elif diagnosis in ("Cataract", "AMD"):
         return {

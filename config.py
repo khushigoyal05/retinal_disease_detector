@@ -19,6 +19,8 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 MODEL_DIR = BASE_DIR / "models"
 
 MODEL_PATH = MODEL_DIR / "retinal_model.tflite"
+CDR_MODEL_PATH = MODEL_DIR / "cdr_model.tflite"
+VESSEL_MODEL_PATH = MODEL_DIR / "vessel_model.tflite"
 INPUT_IMAGE_SIZE = (224, 224)        # (width, height) expected by the model
 CONFIDENCE_THRESHOLD = 0.60          # below this, UI flags result as "uncertain"
 

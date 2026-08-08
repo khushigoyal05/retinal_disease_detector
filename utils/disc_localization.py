@@ -43,56 +43,55 @@ class DiscLocation:
     confidence: float  # fraction of bright-pixel mask kept after largest-component filtering
 
 
-def locate_disc(bgr_image: np.ndarray, brightness_percentile: float = 99.0) -> DiscLocation:
+
+# Real optic discs occupy a tight, predictable size range relative to
+# image width (measured empirically on G1020 ground-truth masks:
+# mean radius/width = 0.0772, std = 0.0076 — very tight clustering).
+EXPECTED_DISC_RADIUS_FRACTION = 0.0772
+MIN_DISC_RADIUS_FRACTION = 0.03
+MAX_DISC_RADIUS_FRACTION = 0.15
+
+
+def _find_disc_candidate(bgr_image: np.ndarray, brightness_percentile: float):
     """
-    Locate the optic disc using classical image processing.
-
-    Args:
-        bgr_image: full-resolution fundus photo, OpenCV BGR order, uint8.
-        brightness_percentile: pixels above this percentile (red channel)
-            are disc candidates. 99.0 = brightest 1% of pixels. Tune this
-            if your rig's exposure differs a lot from clinical cameras.
-
-    Returns:
-        DiscLocation in ORIGINAL image pixel coordinates.
-
-    Raises:
-        ValueError: if no plausible disc region is found — caller should
-            surface this as a "capture quality too low" error, not guess.
+    Try to find a disc-shaped, disc-sized blob at ONE brightness threshold.
+    Returns (contour, confidence) or (None, None) if nothing plausible was
+    found at this threshold — caller tries a different threshold next.
     """
-    if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
-        raise ValueError(f"Expected a 3-channel BGR image, got shape {bgr_image.shape}")
-
     red_channel = bgr_image[:, :, 2]  # OpenCV loads BGR, so index 2 = red
-
     blurred = cv2.GaussianBlur(red_channel, ksize=(9, 9), sigmaX=0)
 
     threshold_value = np.percentile(blurred, brightness_percentile) - 1
     _, bright_mask = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY)
     bright_mask = bright_mask.astype(np.uint8)
 
-    # Kernel scales with image size so this works on any capture resolution
     kernel_size = max(15, int(min(bgr_image.shape[:2]) * 0.02))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     closed_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed_mask, connectivity=8)
     if num_labels <= 1:
-        raise ValueError("No bright candidate region found — image may be underexposed or not a fundus photo")
+        return None, None
 
     total_bright_pixels = int(np.sum(closed_mask > 0))
+    img_width = bgr_image.shape[1]
+    min_radius_px = MIN_DISC_RADIUS_FRACTION * img_width
+    max_radius_px = MAX_DISC_RADIUS_FRACTION * img_width
+    expected_radius_px = EXPECTED_DISC_RADIUS_FRACTION * img_width
 
-    # Check candidates largest-first, but SKIP any that aren't disc-shaped.
-    # Why: closing can fuse the real disc blob with an unrelated bright
-    # patch elsewhere into one big, irregular blob. That fused blob has
-    # the biggest AREA, but its min-enclosing-circle center can land in
-    # the empty gap between the two original blobs — nowhere near the
-    # disc. "Largest" alone isn't enough; it also has to look like a disc.
-    candidate_labels = np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1] + 1  # biggest area first
-
+    # Collect EVERY candidate that passes the shape/size checks, then pick
+    # the one closest to the expected disc size — not just the first one
+    # found. Why: solidity alone doesn't catch elongated-but-smooth blobs
+    # (e.g. a glare streak) since a smooth ellipse is already convex, so
+    # solidity stays near 1.0 even for non-disc shapes. Circularity below
+    # catches those. But even after both checks, more than one candidate
+    # can pass — picking the one whose SIZE best matches the tight known
+    # disc-size distribution is a much stronger tiebreaker than "biggest".
     best_contour = None
-    best_label = None
-    for label in candidate_labels:
+    best_confidence = None
+    best_size_error = None
+
+    for label in range(1, num_labels):  # label 0 = background
         component_mask = (labels == label).astype(np.uint8) * 255
         contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -100,36 +99,85 @@ def locate_disc(bgr_image: np.ndarray, brightness_percentile: float = 99.0) -> D
         contour = max(contours, key=cv2.contourArea)
 
         area = cv2.contourArea(contour)
+        if area <= 0:
+            continue
+
         hull = cv2.convexHull(contour)
         hull_area = cv2.contourArea(hull)
         if hull_area == 0:
             continue
 
-        # solidity: 1.0 = perfectly compact/convex blob (real disc).
-        # A fused/branching blob has extra "arms" outside its own convex
-        # hull filling ratio, so this drops well below 1.0.
+        # solidity: catches branching/concave blobs (fused-together regions)
         solidity = area / hull_area
         if solidity < 0.85:
-            continue  # not disc-shaped, likely a fused blob — try the next candidate
+            continue
 
-        best_contour = contour
-        best_label = label
-        break
+        # circularity: catches smooth-but-elongated blobs solidity misses
+        # (perfect circle = 1.0; a thin streak is much lower even if convex)
+        perimeter = cv2.arcLength(contour, closed=True)
+        if perimeter == 0:
+            continue
 
-    if best_contour is None:
-        raise ValueError("No sufficiently disc-shaped bright region found — image may need recapture")
+        _, candidate_radius = cv2.minEnclosingCircle(contour)
 
-    largest_component_pixels = int(stats[best_label, cv2.CC_STAT_AREA])
-    confidence = largest_component_pixels / total_bright_pixels if total_bright_pixels > 0 else 0.0
+        circularity = (4 * np.pi * area) / (perimeter ** 2)
+        if circularity < 0.6:
+            # print(f"  REJECTED (circularity): {circularity:.3f}  radius_frac={candidate_radius/img_width:.4f}")
+            continue
 
-    (center_x, center_y), radius = cv2.minEnclosingCircle(best_contour)
+        if not (min_radius_px <= candidate_radius <= max_radius_px):
+            continue
 
-    return DiscLocation(
-        center_x=int(round(center_x)),
-        center_y=int(round(center_y)),
-        radius=int(round(radius)),
-        confidence=round(confidence, 3),
-    )
+        size_error = abs(candidate_radius - expected_radius_px)
+        if best_size_error is None or size_error < best_size_error:
+            best_contour = contour
+            best_size_error = size_error
+            best_confidence = int(stats[label, cv2.CC_STAT_AREA]) / total_bright_pixels if total_bright_pixels > 0 else 0.0
+
+    return best_contour, best_confidence
+
+
+# Try strictest threshold first (fewest false positives), loosen if that
+# finds nothing. Covers images where the disc isn't quite bright enough
+# to make the top 1% cut due to normal exposure variation.
+PERCENTILE_SEARCH_ORDER = [99.5, 99.0, 98.0, 97.0, 95.0, 92.0, 90.0]
+
+
+def locate_disc(bgr_image: np.ndarray) -> DiscLocation:
+    """
+    Locate the optic disc using classical image processing.
+
+    Tries several brightness thresholds (strictest first) since fundus
+    photos vary in overall exposure — a fixed threshold makes the disc
+    too dim to detect on some images and too easily confused with glare
+    on others.
+
+    Args:
+        bgr_image: full-resolution fundus photo, OpenCV BGR order, uint8.
+
+    Returns:
+        DiscLocation in ORIGINAL image pixel coordinates.
+
+    Raises:
+        ValueError: if no plausible disc region is found at ANY threshold
+            — caller should surface this as a "capture quality too low"
+            error, not guess.
+    """
+    if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError(f"Expected a 3-channel BGR image, got shape {bgr_image.shape}")
+
+    for percentile in PERCENTILE_SEARCH_ORDER:
+        contour, confidence = _find_disc_candidate(bgr_image, percentile)
+        if contour is not None:
+            (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+            return DiscLocation(
+                center_x=int(round(center_x)),
+                center_y=int(round(center_y)),
+                radius=int(round(radius)),
+                confidence=round(confidence, 3),
+            )
+
+    raise ValueError("No candidate region matched the expected disc shape/size at any threshold — image may need recapture")
 
 
 def crop_to_disc(bgr_image: np.ndarray, disc: DiscLocation, padding_factor: float = 1.8) -> np.ndarray:
@@ -159,4 +207,3 @@ def crop_to_disc(bgr_image: np.ndarray, disc: DiscLocation, padding_factor: floa
     y2 = min(img_h, disc.center_y + half)
 
     return bgr_image[y1:y2, x1:x2]
-

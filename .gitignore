@@ -1,13 +1,22 @@
 venv/
 __pycache__/
 *.pyc
-*.tflite
+# *.tflite
 data/captures/
 data/uploads/
 *.pdf
+training/checkpoints/*.keras
+.vscode/
+.DS_Store
 .pytest_cache/
 dataset_prep/filtered/
 dataset_prep/cdr/_check_output/
 dataset_prep/cdr/raw/
 dataset_prep/cdr/cup_dataset/
 dataset_prep/split/
+dataset_prep/cdr/cup_split/
+dataset_prep/vessel/raw/
+dataset_prep/vessel/vessel_dataset/
+dataset_prep/vessel/vessel_split/
+dataset_prep/vessel/_check_output/
+training/cup_preview_output/

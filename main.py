@@ -130,16 +130,6 @@ def main():
         worker.failed.connect(on_fail)
         worker.start()
 
-        def on_done(result):
-            results.load_results(result, sharpness)
-
-        def on_fail(error):
-            print(f"Inference failed: {error}")
-
-        worker.finished.connect(on_done)
-        worker.failed.connect(on_fail)
-        worker.start()
-
     preview.analyze_requested.connect(on_analyze)
 
     window.show_screen(home)

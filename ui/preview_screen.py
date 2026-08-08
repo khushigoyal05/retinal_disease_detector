@@ -1,77 +1,20 @@
 from pathlib import Path
-from typing import Optional, List
+from typing import List
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QPixmap, QImage
+from PySide6.QtGui import QFont, QPixmap
 
 import numpy as np
 
 
-class ThumbnailWidget(QWidget):
-    """
-    A single frame thumbnail with a sharpness label below it.
-    Highlighted with a black border if it's the best frame.
-    """
-    def __init__(self, index: int, parent=None):
-        super().__init__(parent)
-        self.index = index
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        self._image_label = QLabel()
-        self._image_label.setFixedSize(100, 80)
-        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet(
-            "background-color: #222222; border-radius: 6px;"
-        )
-
-        self._score_label = QLabel(f"Frame {self.index + 1}")
-        self._score_label.setFont(QFont("Inter", 9))
-        self._score_label.setStyleSheet("color: #888888;")
-        self._score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(self._image_label)
-        layout.addWidget(self._score_label)
-
-    def set_image(self, image_path: Path, sharpness: float) -> None:
-        pixmap = QPixmap(str(image_path))
-        self._image_label.setPixmap(
-            pixmap.scaled(100, 80,
-                          Qt.AspectRatioMode.KeepAspectRatio,
-                          Qt.TransformationMode.SmoothTransformation)
-        )
-        self._score_label.setText(f"Frame {self.index + 1} — {sharpness:.1f}")
-
-    def set_best(self, is_best: bool) -> None:
-        """Highlight with black border if this is the best frame."""
-        if is_best:
-            self._image_label.setStyleSheet("""
-                background-color: #222222;
-                border-radius: 6px;
-                border: 3px solid #111111;
-            """)
-            self._score_label.setStyleSheet(
-                "color: #111111; font-weight: bold;"
-            )
-        else:
-            self._image_label.setStyleSheet(
-                "background-color: #222222; border-radius: 6px;"
-            )
-            self._score_label.setStyleSheet("color: #888888;")
-
-
 class PreviewScreen(QWidget):
     """
-    Screen 3 — shows the best captured frame and lets user
-    proceed to analysis or retake.
+    Shows the auto-selected best frame from the capture burst.
+    User either retakes or proceeds to analysis.
+    Sized for 480x320 landscape touchscreen.
 
     Signals:
         analyze_requested(Path): emitted with the best frame path
@@ -89,105 +32,48 @@ class PreviewScreen(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(32, 24, 32, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(8)
 
-        # ── Top bar ───────────────────────────────────────────────
+        # ── Top bar: Retake + Quality badge (title dropped — implied by screen) ──
         top_bar = QHBoxLayout()
 
         btn_retake = QPushButton("← Retake")
-        btn_retake.setFixedWidth(110)
-        btn_retake.setFont(QFont("Inter", 12))
+        btn_retake.setFixedSize(80, 32)
+        btn_retake.setFont(QFont("Inter", 10))
         btn_retake.setStyleSheet("""
             QPushButton {
                 background-color: #FFFFFF;
                 color: #111111;
                 border: 1.5px solid #CCCCCC;
                 border-radius: 6px;
-                padding: 6px 12px;
+                padding: 2px;
             }
             QPushButton:hover { background-color: #F5F5F5; }
         """)
         btn_retake.clicked.connect(self.retake_requested)
 
-        self._title_label = QLabel("Best frame selected")
-        self._title_label.setFont(QFont("Inter", 16, QFont.Weight.Bold))
-        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self._frame_counter = QLabel("")
-        self._frame_counter.setFont(QFont("Inter", 11))
-        self._frame_counter.setStyleSheet("color: #888888;")
-        self._frame_counter.setFixedWidth(110)
-        self._frame_counter.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._quality_label = QLabel("—")
+        self._quality_label.setFont(QFont("Inter", 11, QFont.Weight.Bold))
+        self._quality_label.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         top_bar.addWidget(btn_retake)
         top_bar.addStretch()
-        top_bar.addWidget(self._title_label)
-        top_bar.addStretch()
-        top_bar.addWidget(self._frame_counter)
+        top_bar.addWidget(self._quality_label)
         root.addLayout(top_bar)
 
-        # ── Main image display ────────────────────────────────────
+        # ── Main image — takes almost all the space ──
         self._main_image = QLabel()
         self._main_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._main_image.setStyleSheet(
-            "background-color: #111111; border-radius: 10px;"
+            "background-color: #111111; border-radius: 8px;"
         )
-        self._main_image.setMinimumHeight(240)
         root.addWidget(self._main_image, stretch=1)
 
-        # ── Metrics row ───────────────────────────────────────────
-        metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(12)
-
-        self._metric_frames = {}
-        for key, label in [
-            ("frames",   "Frames captured"),
-            ("sharpness","Best sharpness"),
-            ("quality",  "Quality"),
-        ]:
-            box = QFrame()
-            box.setStyleSheet(
-                "background-color: #F7F7F7; border-radius: 8px;"
-            )
-            box_layout = QVBoxLayout(box)
-            box_layout.setContentsMargins(12, 8, 12, 8)
-            box_layout.setSpacing(2)
-
-            lbl = QLabel(label)
-            lbl.setFont(QFont("Inter", 9))
-            lbl.setStyleSheet("color: #888888; background: transparent;")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            val = QLabel("—")
-            val.setFont(QFont("Inter", 14, QFont.Weight.Bold))
-            val.setStyleSheet("color: #111111; background: transparent;")
-            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            box_layout.addWidget(lbl)
-            box_layout.addWidget(val)
-            self._metric_frames[key] = val
-            metrics_row.addWidget(box)
-
-        root.addLayout(metrics_row)
-
-        # ── Thumbnail strip ───────────────────────────────────────
-        thumb_row = QHBoxLayout()
-        thumb_row.setSpacing(12)
-        self._thumbnails: List[ThumbnailWidget] = []
-
-        for i in range(3):
-            thumb = ThumbnailWidget(i)
-            self._thumbnails.append(thumb)
-            thumb_row.addWidget(thumb)
-
-        thumb_row.addStretch()
-        root.addLayout(thumb_row)
-
-        # ── Analyze button ────────────────────────────────────────
+        # ── Analyze button ──
         self._btn_analyze = QPushButton("Analyze Retina →")
-        self._btn_analyze.setFixedHeight(56)
-        self._btn_analyze.setFont(QFont("Inter", 15, QFont.Weight.Bold))
+        self._btn_analyze.setFixedHeight(48)
+        self._btn_analyze.setFont(QFont("Inter", 13, QFont.Weight.Bold))
         self._btn_analyze.setEnabled(False)
         self._btn_analyze.clicked.connect(self._on_analyze)
         root.addWidget(self._btn_analyze)
@@ -195,8 +81,8 @@ class PreviewScreen(QWidget):
     def load_frames(self, frame_paths: List[Path],
                     sharpness_scores: List[float]) -> None:
         """
-        Called after capture. Receives all frame paths + their
-        sharpness scores, picks the best one, updates the UI.
+        Called after capture. Picks the best frame internally
+        (same logic as before) but only displays that one frame.
         """
         self._frames = frame_paths
         self._sharpness_scores = sharpness_scores
@@ -205,7 +91,6 @@ class PreviewScreen(QWidget):
         best_path = frame_paths[self._best_index]
         best_score = sharpness_scores[self._best_index]
 
-        # Main image
         pixmap = QPixmap(str(best_path))
         self._main_image.setPixmap(
             pixmap.scaled(
@@ -216,27 +101,17 @@ class PreviewScreen(QWidget):
             )
         )
 
-        # Metrics
-        self._metric_frames["frames"].setText(str(len(frame_paths)))
-        self._metric_frames["sharpness"].setText(f"{best_score:.1f}")
         quality = (
             "Excellent" if best_score > 100 else
             "Good"      if best_score > 50  else
             "Fair"      if best_score > 20  else
             "Poor"
         )
-        self._metric_frames["quality"].setText(quality)
-
-        # Frame counter
-        self._frame_counter.setText(
-            f"Frame {self._best_index + 1} / {len(frame_paths)}"
+        self._quality_label.setText(f"Quality: {quality}")
+        self._quality_label.setStyleSheet(
+            "color: #111111;" if quality in ("Excellent", "Good")
+            else "color: #B00020;"  # red-ish warning for Fair/Poor
         )
-
-        # Thumbnails
-        for i, thumb in enumerate(self._thumbnails):
-            if i < len(frame_paths):
-                thumb.set_image(frame_paths[i], sharpness_scores[i])
-                thumb.set_best(i == self._best_index)
 
         self._btn_analyze.setEnabled(True)
 

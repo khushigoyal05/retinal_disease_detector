@@ -1,7 +1,7 @@
 """
 Compares locate_disc() output against ground-truth disc location (from mask
 value=1) for every image. Flags detections that are too far off or too
-different in size — these should be EXCLUDED from training, not silently
+different in size -- these should be EXCLUDED from training, not silently
 kept as bad data.
 """
 import sys
@@ -31,6 +31,13 @@ def main():
     image_files = sorted((RAW_DIR / "Images").glob("*.jpg"))
     results = []
 
+    # NEW: for the shape/position diagnostic -- only filled in for
+    # successful detections (dist_ratio is not None)
+    diag_det_radius_frac = []
+    diag_true_radius_frac = []
+    diag_det_cx_frac = []
+    diag_true_cx_frac = []
+
     for i, img_path in enumerate(image_files, start=1):
         if i % 100 == 0:
             print(f"Progress: {i}/{len(image_files)}")
@@ -58,6 +65,13 @@ def main():
 
         results.append((img_path.stem, dist_ratio, true_r, detected.radius))
 
+        # NEW: record fractions (of image width) for the diagnostic
+        img_w = bgr.shape[1]
+        diag_det_radius_frac.append(detected.radius / img_w)
+        diag_true_radius_frac.append(true_r / img_w)
+        diag_det_cx_frac.append(detected.center_x / img_w)
+        diag_true_cx_frac.append(true_cx / img_w)
+
     # summarize
     valid = [r for r in results if r[1] is not None]
     failed = [r for r in results if r[1] is None]
@@ -71,6 +85,12 @@ def main():
         pct_bad = 100 * np.mean(dist_ratios > thresh)
         print(f"  fraction with dist_ratio > {thresh}: {pct_bad:.1f}%")
 
+    # NEW: shape/position diagnostic
+    print("\n--- shape/position diagnostic ---")
+    print(f"detected radius/width  mean: {np.mean(diag_det_radius_frac):.4f}  std: {np.std(diag_det_radius_frac):.4f}")
+    print(f"true radius/width      mean: {np.mean(diag_true_radius_frac):.4f}  std: {np.std(diag_true_radius_frac):.4f}")
+    print(f"detected center_x/width std: {np.std(diag_det_cx_frac):.4f}")
+    print(f"true center_x/width     std: {np.std(diag_true_cx_frac):.4f}")
 
 
 if __name__ == "__main__":
